@@ -3,9 +3,6 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-import copy
-import json
-import math
 import logging
 import numpy as np
 

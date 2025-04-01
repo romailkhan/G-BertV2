@@ -1,18 +1,19 @@
-from __future__ import absolute_import, division, print_function
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 import os
 import math
 import logging
+import contextlib
 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
-# from torch.nn import LayerNorm
+from torch.amp import autocast
 import torch.nn.functional as F
 from config import BertConfig
 from graph_models import FuseEmbeddings
-from torch.cuda.amp import autocast  # For mixed precision training
-import torch.utils.checkpoint as checkpoint  # For gradient checkpointing
 
 logger = logging.getLogger(__name__)
 
@@ -49,41 +50,34 @@ class MultiHeadedAttention(nn.Module):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
 
-        # More efficient attention computation
+        # We assume d_v always equals d_k
         self.d_k = config.hidden_size // config.num_attention_heads
         self.h = config.num_attention_heads
 
-        # Combined linear projections for Q, K, V
-        self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
+        # Combine all linear projections into one for better parallelization
+        self.all_head_size = self.h * self.d_k
+        self.qkv_proj = nn.Linear(config.hidden_size, 3 * self.all_head_size, bias=False)
         self.output_linear = nn.Linear(config.hidden_size, config.hidden_size)
-
-        # Scaled attention
+        
+        # Add attention scaling factor
         self.attention_scale = math.sqrt(self.d_k)
         self.dropout = nn.Dropout(p=config.attention_probs_dropout_prob)
 
     def forward(self, query, key, value, mask=None):
         batch_size = query.size(0)
-
-        # Efficient combined projection
+        
+        # More efficient combined projection
         qkv = self.qkv_proj(query)
+        qkv = qkv.reshape(batch_size, -1, self.h, 3 * self.d_k)
         q, k, v = qkv.chunk(3, dim=-1)
+        
+        # 2) Apply attention on all the projected vectors in batch.
+        x, attn = self.attention(
+            query, key, value, mask=mask, dropout=self.dropout)
 
-        # Reshape for attention computation
-        q = q.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-        k = k.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-        v = v.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.attention_scale
-
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        x = torch.matmul(attn, v)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.h * self.d_k)
+        # 3) "Concat" using a view and apply a final linear.
+        x = x.transpose(1, 2).contiguous().view(
+            batch_size, -1, self.h * self.d_k)
 
         return self.output_linear(x)
 
@@ -157,18 +151,24 @@ class TransformerBlock(nn.Module):
         self.input_sublayer = SublayerConnection(config)
         self.output_sublayer = SublayerConnection(config)
         self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
+        
+        # Add gradient checkpointing option
+        self.gradient_checkpointing = False
 
     def forward(self, x, mask):
-        # Residual connections with pre-layer normalization
-        residual = x
-        x = self.input_sublayer(x, lambda _x: self.attention.forward(_x, _x, _x, mask=mask))
-        x = residual + self.dropout(x)
-        
-        residual = x
-        x = self.output_sublayer(x, self.feed_forward)
-        x = residual + self.dropout(x)
-        
+        if self.gradient_checkpointing and self.training:
+            x = torch.utils.checkpoint.checkpoint(
+                self._forward_impl, x, mask
+            )
+        else:
+            x = self._forward_impl(x, mask)
         return x
+
+    def _forward_impl(self, x, mask):
+        x = self.input_sublayer(
+            x, lambda _x: self.attention.forward(_x, _x, _x, mask=mask))
+        x = self.output_sublayer(x, self.feed_forward)
+        return self.dropout(x)
 
 
 class BertEmbeddings(nn.Module):
@@ -304,38 +304,30 @@ class BERT(PreTrainedBertModel):
             assert dx_voc is not None
             assert rx_voc is not None
 
-        # Add configuration options
-        self.gradient_checkpointing = False
-        self.fp16_enabled = False
-        
-        # Embedding layer
-        self.embedding = FuseEmbeddings(config, dx_voc, rx_voc) if config.graph else BertEmbeddings(config)
-        
-        # Multi-head attention blocks with better memory efficiency
-        self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.num_hidden_layers)
-        ])
-        
-        # Add layer-wise learning rate decay
-        self.layer_decay = getattr(config, 'layer_decay', 0.95)
-        
+        # embedding for BERT, sum of positional, segment, token embeddings
+        self.embedding = FuseEmbeddings(
+            config, dx_voc, rx_voc) if config.graph else BertEmbeddings(config)
+
+        # multi-layers transformer blocks, deep network
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+
+        # pool first output
+        # self.pooler = BertPooler(config)
+
         self.apply(self.init_bert_weights)
 
+        # Add mixed precision support
+        self.fp16_enabled = False
+
     def forward(self, x, token_type_ids=None, input_positions=None, input_sides=None):
-        # Enable automatic mixed precision training
-        with autocast() if self.fp16_enabled else nullcontext():
-            # Attention masking for padded tokens
+        # Enable automatic mixed precision
+        with autocast('cuda') if self.fp16_enabled else contextlib.nullcontext():
             mask = (x > 1).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
-            
-            # Embedding with dropout
             x = self.embedding(x, token_type_ids)
             
-            # Transformer blocks with gradient checkpointing
             for transformer in self.transformer_blocks:
-                if self.gradient_checkpointing and self.training:
-                    x = checkpoint.checkpoint(transformer, x, mask)
-                else:
-                    x = transformer(x, mask)
+                x = transformer.forward(x, mask)
             
             return x, x[:, 0]
 
@@ -383,18 +375,3 @@ class BertLMPredictionHead(nn.Module):
         hidden_states = self.transform(hidden_states)
         hidden_states = self.decoder(hidden_states)
         return hidden_states
-
-
-# 4. Add Fast Layer Normalization
-class FastLayerNorm(nn.Module):
-    def __init__(self, config: BertConfig):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(config.hidden_size))
-        self.bias = nn.Parameter(torch.zeros(config.hidden_size))
-        self.variance_epsilon = 1e-12
-
-    def forward(self, x):
-        u = x.mean(-1, keepdim=True)
-        s = (x - u).pow(2).mean(-1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-        return self.weight * x + self.bias

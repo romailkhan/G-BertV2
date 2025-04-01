@@ -1,16 +1,20 @@
-# G-Bert
-Pre-training of Graph Augmented Transformers for Medication Recommendation
+# G-BERT v2
+optimized pre-training of graph augmented transformers for medication recommendation
 
-## Intro
-G-Bert combined the power of **G**raph Neural Networks and **BERT** (Bidirectional Encoder Representations from Transformers) for medical code representation and medication recommendation. We use the graph neural networks (GNNs) to represent the structure information of medical codes from a medical ontology. Then we integrate the GNN representation into a transformer-based visit encoder and pre-train it on single-visit EHR data. The pre-trained visit encoder and representation can be fine-tuned for downstream medical prediction tasks. Our model is the first to bring the language model pre-training schema into the healthcare domain and it achieved state-of-the-art performance on the medication recommendation task.
+## project dependencies
+ensure [poetry](https://python-poetry.org/) is installed and then run the following command to install all required dependencies
+```bash
+poetry install
+```
 
-## Requirements
-- pytorch>=0.4
-- python>=3.5
-- torch_geometric==1.0.3
+note: make sure the terminal or the ide are using the created poetry environment. if not, run below command and follow the prompt.
 
-## Guide
-We list the structure of this repo as follows:
+```bash
+poetry env activate
+```
+
+## directory overview
+we list the structure of this repo as follows:
 ```latex
 .
 ├── [4.0K]  code/
@@ -45,19 +49,15 @@ We list the structure of this repo as follows:
         ├── [ 371]  bert_config.json 
         └── [ 12M]  pytorch_model.bin
 ```
-### Preprocessing Data
-We have released the preprocessing codes named data/EDA.ipynb to process data using raw files from MIMIC-III dataset. You can download data files from [MIMIC](https://mimic.physionet.org/gettingstarted/dbsetup/) and get necessary mapping files from [GAMENet](https://github.com/sjy1203/GAMENet).
 
-### Quick Test
-To validate the performance of G-Bert, you can run the following script since we have provided the trained model binary file and well-preprocessed data.
+## run validation tests
+to validate the performance of G-Bert v2, you can run the following script since we have provided the trained model binary file and well-preprocessed data.
 ```bash
 cd code/
 python run_gbert.py --model_name GBert-predict --use_pretrain --pretrain_dir ../saved/GBert-predict --graph
 ```
-## Cite 
 
-Please cite our paper if you find this code helpful:
-
+## original source citation and code:
 ```
 @article{shang2019pre,
   title={Pre-training of Graph Augmented Transformers for Medication Recommendation},
@@ -65,12 +65,6 @@ Please cite our paper if you find this code helpful:
   journal={arXiv preprint arXiv:1906.00346},
   year={2019}
 }
+
+code: https://github.com/jshang123/G-Bert
 ```
-
-## Acknowledgement
-Many thanks to the open source repositories and libraries to speed up our coding progress.
-- [GAMENet](https://github.com/sjy1203/GAMENet)
-- [Bert_HuggingFace](https://github.com/huggingface/pytorch-pretrained-BERT)
-- [pytorch_geometric](https://github.com/rusty1s/pytorch_geometric)
-
-
