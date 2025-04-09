@@ -7,7 +7,7 @@ import numpy as np
 import inspect
 
 from torch_geometric.nn import GATv2Conv
-from torch_geometric.utils import scatter_, softmax, add_self_loops
+from torch_geometric.utils import scatter, softmax, add_self_loops
 from torch_geometric.nn.inits import glorot, zeros, uniform
 
 from build_tree import build_stage_one_edges, build_stage_two_edges, build_cominbed_edges
@@ -16,7 +16,7 @@ from build_tree import build_icd9_tree, build_atc_tree
 
 class OntologyEmbedding(nn.Module):
     def __init__(self, voc, build_tree_func,
-                 in_channels=100, out_channels=20, heads=5):
+                 in_channels=100, out_channels=20, head=5):
         super(OntologyEmbedding, self).__init__()
 
         # initial tree edges
@@ -29,14 +29,14 @@ class OntologyEmbedding(nn.Module):
         self.graph_voc = graph_voc
 
         # construct model
-        assert in_channels == heads * out_channels
+        assert in_channels == head * out_channels
         # self.g = GATConv(in_channels=in_channels,
         #                  out_channels=out_channels,
         #                  heads=heads)
 
         self.g = GATv2(in_channels=in_channels,
                          out_channels=out_channels,
-                         heads=heads)
+                         head=head)
 
         # tree embedding
         num_nodes = len(graph_voc.word2idx)
@@ -84,7 +84,7 @@ class GATv2(nn.Module):
         self.gat = GATv2Conv(
             in_channels=in_channels,
             out_channels=out_channels,
-            heads=heads,
+            heads=head,
             concat=concat,
             negative_slope=negative_slope,
             dropout=dropout,
@@ -98,7 +98,7 @@ class GATv2(nn.Module):
     def __repr__(self):
         return '{}({}, {}, heads={})'.format(self.__class__.__name__,
                                              self.in_channels,
-                                             self.out_channels, self.heads)
+                                             self.out_channels, self.head)
 
 # class MessagePassing(nn.Module):
 #     r"""Base class for creating message passing layers
