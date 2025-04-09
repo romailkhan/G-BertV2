@@ -215,6 +215,32 @@ def load_dataset(args):
     return tokenizer, tuple(map(lambda x: EHRDataset(load_ids(data, x), tokenizer, max_seq_len), ids_file))
 
 
+def convert_state_dict(state_dict):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if 'g.weight' in k:
+            # Convert old GAT weights to new format
+            base_key = k.replace('g.weight', 'g.gat.lin_l.weight')
+            new_state_dict[base_key] = v
+        elif 'g.att' in k:
+            # Convert attention weights
+            base_key = k.replace('g.att', 'g.gat.att')
+            new_state_dict[base_key] = v
+        elif 'g.bias' in k:
+            # Convert bias
+            base_key = k.replace('g.bias', 'g.gat.bias')
+            new_state_dict[base_key] = v
+        elif 'linear_layers' in k:
+            # Convert transformer attention layers
+            layer_num = k.split('.')[3]
+            if layer_num == '0':
+                new_key = k.replace(f'linear_layers.{layer_num}', 'qkv_proj')
+                new_state_dict[new_key] = v
+        else:
+            new_state_dict[k] = v
+    return new_state_dict
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -245,10 +271,10 @@ def main():
                         default=False,
                         action='store_true',
                         help="if use ontology embedding")
-    parser.add_argument("--therhold",
+    parser.add_argument("--threshold",
                         default=0.3,
                         type=float,
-                        help="therhold.")
+                        help="threshold.")
     parser.add_argument("--max_seq_length",
                         default=55,
                         type=int,
@@ -456,7 +482,8 @@ def main():
         def test(task=0):
             # Load a trained model that you have fine-tuned
             model_state_dict = torch.load(rx_output_model_file)
-            model.load_state_dict(model_state_dict)
+            model_state_dict = convert_state_dict(model_state_dict)
+            model.load_state_dict(model_state_dict, strict=False)
             model.to(device)
 
             model.eval()

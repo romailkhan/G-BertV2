@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import math
 import logging
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -11,7 +12,7 @@ from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 import torch.nn.functional as F
 from config import BertConfig
 from graph_models import FuseEmbeddings
-from torch.cuda.amp import autocast  # For mixed precision training
+from torch.amp import autocast  # Updated import
 import torch.utils.checkpoint as checkpoint  # For gradient checkpointing
 
 logger = logging.getLogger(__name__)
@@ -322,8 +323,8 @@ class BERT(PreTrainedBertModel):
         self.apply(self.init_bert_weights)
 
     def forward(self, x, token_type_ids=None, input_positions=None, input_sides=None):
-        # Enable automatic mixed precision training
-        with autocast() if self.fp16_enabled else nullcontext():
+        # Updated autocast usage with device type
+        with autocast('cuda') if self.fp16_enabled else nullcontext():
             # Attention masking for padded tokens
             mask = (x > 1).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
             

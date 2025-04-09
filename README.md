@@ -50,11 +50,17 @@ we list the structure of this repo as follows:
         └── [ 12M]  pytorch_model.bin
 ```
 
-## run validation tests
-to validate the performance of G-Bert v2, you can run the following script since we have provided the trained model binary file and well-preprocessed data.
+
+## retrain weights and model
 ```bash
 cd code/
-python run_gbert.py --model_name GBert-predict --use_pretrain --pretrain_dir ../saved/GBert-predict --graph
+python run_gbert.py --model_name GBert-predict --graph --do_train
+```
+
+## test trained model on test data set
+```bash
+cd code/
+python run_gbert.py --model_name GBert-predict --graph --do_test
 ```
 
 ## original source citation and code:
