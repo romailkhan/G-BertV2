@@ -271,10 +271,10 @@ def main():
                         default=False,
                         action='store_true',
                         help="if use ontology embedding")
-    parser.add_argument("--threshold",
+    parser.add_argument("--therhold",
                         default=0.3,
                         type=float,
-                        help="threshold.")
+                        help="therhold.")
     parser.add_argument("--max_seq_length",
                         default=55,
                         type=int,
