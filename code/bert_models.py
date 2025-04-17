@@ -53,32 +53,36 @@ class RotaryPositionalEmbedding(nn.Module):
         self.dim = dim
         self.max_seq_len = max_seq_len
         
-        # Create rotary positional embedding frequencies
-        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        # Create frequencies for the full dimension
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         
-    def forward(self, x, seq_len=None):
-        seq_len = seq_len if seq_len is not None else x.shape[1]
-        seq_range = torch.arange(seq_len, device=x.device)
-        # Outer product of seq_range and inv_freq
-        sinusoidal_inp = torch.einsum('i,j->ij', seq_range, self.inv_freq)
-        # Apply sin and cos to alternate positions
-        sin, cos = torch.sin(sinusoidal_inp), torch.cos(sinusoidal_inp)
-        return sin, cos
-    
+    def forward(self, seq_len, device):
+        """Generate sin/cos embeddings for the given sequence length"""
+        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        return torch.sin(freqs), torch.cos(freqs)
+
     @staticmethod
-    def apply_rotary_pos_emb(x, sin, cos):
-        # x shape: [batch, seq, heads, dim]
-        # Reshape x for operations
-        x2 = x.reshape(*x.shape[:-1], -1, 2)
+    def apply_rotary_pos_emb(q, k, sin, cos):
+        """Apply rotary position embeddings to queries and keys"""
+        sin = sin.to(dtype=q.dtype, device=q.device)
+        cos = cos.to(dtype=q.dtype, device=q.device)
         
-        # Apply rotary embeddings
-        x_transformed = torch.stack([
-            x2[..., 0] * cos - x2[..., 1] * sin,
-            x2[..., 1] * cos + x2[..., 0] * sin
-        ], dim=-1).flatten(-2)
+        # Ensure broadcasting dimensions match
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos = cos.unsqueeze(0).unsqueeze(0)
         
-        return x_transformed
+        # Apply rotary embeddings directly
+        q_out = q * cos + rotate_half(q) * sin
+        k_out = k * cos + rotate_half(k) * sin
+        
+        return q_out, k_out
+
+def rotate_half(x):
+    """Helper function to rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
 
 class MultiHeadedAttention(nn.Module):
@@ -93,7 +97,7 @@ class MultiHeadedAttention(nn.Module):
         self.d_k = config.hidden_size // config.num_attention_heads
         self.h = config.num_attention_heads
         self.dropout = config.attention_probs_dropout_prob
-        self.use_rotary = getattr(config, 'use_rotary', False)
+        self.use_rotary = getattr(config, 'use_rotary', True)
         
         # Linear projections for Q, K, V
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
@@ -116,17 +120,16 @@ class MultiHeadedAttention(nn.Module):
         k = self.k_proj(key)
         v = self.v_proj(value)
         
-        # Reshape for multi-head attention
+        # Reshape for multi-head attention [batch, seq, heads * dim] -> [batch, heads, seq, dim]
         q = q.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
         k = k.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
         v = v.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
         
         # Apply rotary embeddings if enabled
         if self.use_rotary:
-            sin, cos = self.rotary_emb(q, seq_len)
-            q = self.rotary_emb.apply_rotary_pos_emb(q, sin, cos)
-            k = self.rotary_emb.apply_rotary_pos_emb(k, sin, cos)
-            
+            sin, cos = self.rotary_emb(seq_len, query.device)
+            q, k = self.rotary_emb.apply_rotary_pos_emb(q, k, sin, cos)
+        
         # Use PyTorch 2.0's scaled_dot_product_attention for efficient attention
         attn_output = F.scaled_dot_product_attention(
             q, k, v, 
@@ -135,7 +138,7 @@ class MultiHeadedAttention(nn.Module):
             is_causal=False
         )
         
-        # Reshape and apply output projection
+        # Reshape back [batch, heads, seq, dim] -> [batch, seq, heads * dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, -1, self.h * self.d_k
         )
@@ -217,7 +220,6 @@ class TransformerBlock(nn.Module):
         self.output_sublayer = SublayerConnection(config)
         self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
         
-        # Normalize at the end as well for improved stability
         self.final_norm = FastLayerNorm(config.hidden_size)
         self.prenorm = getattr(config, 'prenorm', True)
 
@@ -252,7 +254,7 @@ class BertEmbeddings(nn.Module):
         self.token_type_embeddings = nn.Embedding(2, config.hidden_size)
         
         # Add position embeddings if not using rotary embeddings
-        self.use_rotary = getattr(config, 'use_rotary', False)
+        self.use_rotary = getattr(config, 'use_rotary', True)
         if not self.use_rotary and getattr(config, 'use_position_embeddings', True):
             self.position_embeddings = nn.Embedding(
                 config.max_position_embeddings, config.hidden_size
@@ -344,7 +346,6 @@ class PreTrainedBertModel(nn.Module):
         missing_keys = []
         unexpected_keys = []
         error_msgs = []
-        # copy state_dict so _load_from_state_dict can modify it
         metadata = getattr(state_dict, '_metadata', None)
         state_dict = state_dict.copy()
         if metadata is not None:
@@ -441,7 +442,6 @@ class BERT(PreTrainedBertModel):
                 else:
                     x = transformer(x, attention_mask)
             
-            # Return sequence and pooled output (first token)
             return x, x[:, 0]
     
     def get_extended_attention_mask(self, attention_mask, input_shape, device):

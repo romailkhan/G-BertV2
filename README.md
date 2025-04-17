@@ -54,7 +54,7 @@ we list the structure of this repo as follows:
 ## retrain weights and model
 ```bash
 cd code/
-python run_gbert.py --model_name GBert-predict --graph --do_train
+python run_gbert.py --model_name GBert-predict --graph --do_train --num_train_epochs 100
 ```
 
 ## test trained model on test data set
