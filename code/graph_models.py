@@ -36,7 +36,8 @@ class OntologyEmbedding(nn.Module):
 
         self.g = GATv2(in_channels=in_channels,
                          out_channels=out_channels,
-                         head=head)
+                         head=head,
+                         num_layers=3)
 
         # tree embedding
         num_nodes = len(graph_voc.word2idx)
@@ -70,36 +71,87 @@ class OntologyEmbedding(nn.Module):
         glorot(self.embedding)
 
 
+# class GATv2(nn.Module):
+#     def __init__(self,
+#                 in_channels,
+#                 out_channels,
+#                 head=1,
+#                 concat=True,
+#                 negative_slope=0.2,
+#                 dropout=0,
+#                 bias=True):
+#         super(GATv2, self).__init__()
+
+#         self.gat = GATv2Conv(
+#             in_channels=in_channels,
+#             out_channels=out_channels,
+#             heads=head,
+#             concat=concat,
+#             negative_slope=negative_slope,
+#             dropout=dropout,
+#             bias=bias)
+
+#     def forward(self, x, edge_index):
+#         x = self.gat(x, edge_index)
+#         return x
+
+
+#     def __repr__(self):
+#         return '{}({}, {}, heads={})'.format(self.__class__.__name__,
+#                                              self.in_channels,
+#                                              self.out_channels, self.head)
+
 class GATv2(nn.Module):
     def __init__(self,
-                in_channels,
-                out_channels,
-                head=1,
-                concat=True,
-                negative_slope=0.2,
-                dropout=0,
-                bias=True):
+                 in_channels,
+                 out_channels,
+                 head=1,
+                 concat=True,
+                 negative_slope=0.2,
+                 dropout=0.1,
+                 bias=True,
+                 num_layers=2):
         super(GATv2, self).__init__()
 
-        self.gat = GATv2Conv(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            heads=head,
-            concat=concat,
-            negative_slope=negative_slope,
-            dropout=dropout,
-            bias=bias)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.head = head
+        self.concat = concat
+        self.num_layers = num_layers
+
+        layers = []
+
+        for i in range(num_layers):
+            in_dim = in_channels if i == 0 else out_channels * head if concat else out_channels
+            out_dim = out_channels
+
+            layers.append(
+                GATv2Conv(
+                    in_channels=in_dim,
+                    out_channels=out_dim,
+                    heads=head,
+                    concat=concat,
+                    negative_slope=negative_slope,
+                    dropout=dropout,
+                    bias=bias
+                )
+            )
+
+        self.gat = nn.ModuleList(layers)
+        self.activation = nn.ReLU()
 
     def forward(self, x, edge_index):
-        x = self.gat(x, edge_index)
+        for layer in self.gat:
+            x = layer(x, edge_index)
+            x = self.activation(x)
         return x
 
-
     def __repr__(self):
-        return '{}({}, {}, heads={})'.format(self.__class__.__name__,
-                                             self.in_channels,
-                                             self.out_channels, self.head)
-
+        return '{}({}, {}, heads={}, layers={})'.format(self.__class__.__name__,
+                                                        self.in_channels,
+                                                        self.out_channels,
+                                                        self.head,
+                                                        self.num_layers)
 
 class ConcatEmbeddings(nn.Module):
     """Concat rx and dx ontology embedding for easy access
