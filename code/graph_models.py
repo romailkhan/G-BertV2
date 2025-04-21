@@ -6,7 +6,8 @@ import numpy as np
 
 import inspect
 
-from torch_geometric.utils import scatter_, softmax, add_self_loops
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.utils import scatter, softmax, add_self_loops
 from torch_geometric.nn.inits import glorot, zeros, uniform
 
 from build_tree import build_stage_one_edges, build_stage_two_edges, build_cominbed_edges
@@ -15,7 +16,7 @@ from build_tree import build_icd9_tree, build_atc_tree
 
 class OntologyEmbedding(nn.Module):
     def __init__(self, voc, build_tree_func,
-                 in_channels=100, out_channels=20, heads=5):
+                 in_channels=100, out_channels=20, head=5):
         super(OntologyEmbedding, self).__init__()
 
         # initial tree edges
@@ -28,10 +29,15 @@ class OntologyEmbedding(nn.Module):
         self.graph_voc = graph_voc
 
         # construct model
-        assert in_channels == heads * out_channels
-        self.g = GATConv(in_channels=in_channels,
+        assert in_channels == head * out_channels
+        # self.g = GATConv(in_channels=in_channels,
+        #                  out_channels=out_channels,
+        #                  heads=heads)
+
+        self.g = GATv2(in_channels=in_channels,
                          out_channels=out_channels,
-                         heads=heads)
+                         head=head,
+                         num_layers=3)
 
         # tree embedding
         num_nodes = len(graph_voc.word2idx)
@@ -65,183 +71,87 @@ class OntologyEmbedding(nn.Module):
         glorot(self.embedding)
 
 
-class MessagePassing(nn.Module):
-    r"""Base class for creating message passing layers
+# class GATv2(nn.Module):
+#     def __init__(self,
+#                 in_channels,
+#                 out_channels,
+#                 head=1,
+#                 concat=True,
+#                 negative_slope=0.2,
+#                 dropout=0,
+#                 bias=True):
+#         super(GATv2, self).__init__()
 
-    .. math::
-        \mathbf{x}_i^{\prime} = \gamma_{\mathbf{\Theta}} \left( \mathbf{x}_i,
-        \square_{j \in \mathcal{N}(i)} \, \phi_{\mathbf{\Theta}}
-        \left(\mathbf{x}_i, \mathbf{x}_j,\mathbf{e}_{i,j}\right) \right),
+#         self.gat = GATv2Conv(
+#             in_channels=in_channels,
+#             out_channels=out_channels,
+#             heads=head,
+#             concat=concat,
+#             negative_slope=negative_slope,
+#             dropout=dropout,
+#             bias=bias)
 
-    where :math:`\square` denotes a differentiable, permutation invariant
-    function, *e.g.*, sum, mean or max, and :math:`\gamma_{\mathbf{\Theta}}`
-    and :math:`\phi_{\mathbf{\Theta}}` denote differentiable functions such as
-    MLPs.
-    See `here <https://rusty1s.github.io/pytorch_geometric/build/html/notes/
-    create_gnn.html>`__ for the accompanying tutorial.
-
-    """
-
-    def __init__(self, aggr='add'):
-        super(MessagePassing, self).__init__()
-
-        self.message_args = inspect.getargspec(self.message)[0][1:]
-        self.update_args = inspect.getargspec(self.update)[0][2:]
-
-    def propagate(self, aggr, edge_index, **kwargs):
-        r"""The initial call to start propagating messages.
-        Takes in an aggregation scheme (:obj:`"add"`, :obj:`"mean"` or
-        :obj:`"max"`), the edge indices, and all additional data which is
-        needed to construct messages and to update node embeddings."""
-
-        assert aggr in ['add', 'mean', 'max']
-        kwargs['edge_index'] = edge_index
-
-        size = None
-        message_args = []
-        for arg in self.message_args:
-            if arg[-2:] == '_i':
-                tmp = kwargs[arg[:-2]]
-                size = tmp.size(0)
-                message_args.append(tmp[edge_index[0]])
-            elif arg[-2:] == '_j':
-                tmp = kwargs[arg[:-2]]
-                size = tmp.size(0)
-                message_args.append(tmp[edge_index[1]])
-            else:
-                message_args.append(kwargs[arg])
-
-        update_args = [kwargs[arg] for arg in self.update_args]
-
-        out = self.message(*message_args)
-        out = scatter_(aggr, out, edge_index[0], dim_size=size)
-        out = self.update(out, *update_args)
-
-        return out
-
-    def message(self, x_j):  # pragma: no cover
-        r"""Constructs messages in analogy to :math:`\phi_{\mathbf{\Theta}}`
-        for each edge in :math:`(i,j) \in \mathcal{E}`.
-        Can take any argument which was initially passed to :meth:`propagate`.
-        In addition, features can be lifted to the source node :math:`i` and
-        target node :math:`j` by appending :obj:`_i` or :obj:`_j` to the
-        variable name, *.e.g.* :obj:`x_i` and :obj:`x_j`."""
-
-        return x_j
-
-    def update(self, aggr_out):  # pragma: no cover
-        r"""Updates node embeddings in analogy to
-        :math:`\gamma_{\mathbf{\Theta}}` for each node
-        :math:`i \in \mathcal{V}`.
-        Takes in the output of aggregation as first argument and any argument
-        which was initially passed to :meth:`propagate`."""
-
-        return aggr_out
+#     def forward(self, x, edge_index):
+#         x = self.gat(x, edge_index)
+#         return x
 
 
-class GATConv(MessagePassing):
-    r"""The graph attentional operator from the `"Graph Attention Networks"
-    <https://arxiv.org/abs/1710.10903>`_ paper
+#     def __repr__(self):
+#         return '{}({}, {}, heads={})'.format(self.__class__.__name__,
+#                                              self.in_channels,
+#                                              self.out_channels, self.head)
 
-    .. math::
-        \mathbf{x}^{\prime}_i = \alpha_{i,i}\mathbf{\Theta}\mathbf{x}_{j} +
-        \sum_{j \in \mathcal{N}(i)} \alpha_{i,j}\mathbf{\Theta}\mathbf{x}_{j},
-
-    where the attention coefficients :math:`\alpha_{i,j}` are computed as
-
-    .. math::
-        \alpha_{i,j} =
-        \frac{
-        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
-        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_j]
-        \right)\right)}
-        {\sum_{k \in \mathcal{N}(i) \cup \{ i \}}
-        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
-        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_k]
-        \right)\right)}.
-
-    Args:
-        in_channels (int): Size of each input sample.
-        out_channels (int): Size of each output sample.
-        heads (int, optional): Number of multi-head-attentions. (default:
-            :obj:`1`)
-        concat (bool, optional): If set to :obj:`False`, the multi-head
-        attentions are averaged instead of concatenated. (default: :obj:`True`)
-        negative_slope (float, optional): LeakyReLU angle of the negative
-            slope. (default: :obj:`0.2`)
-        dropout (float, optional): Dropout probability of the normalized
-            attention coefficients which exposes each node to a stochastically
-            sampled neighborhood during training. (default: :obj:`0`)
-        bias (bool, optional): If set to :obj:`False`, the layer will not learn
-            an additive bias. (default: :obj:`True`)
-    """
-
+class GATv2(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels,
-                 heads=1,
+                 head=1,
                  concat=True,
                  negative_slope=0.2,
-                 dropout=0,
-                 bias=True):
-        super(GATConv, self).__init__()
+                 dropout=0.1,
+                 bias=True,
+                 num_layers=2):
+        super(GATv2, self).__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.heads = heads
+        self.head = head
         self.concat = concat
-        self.negative_slope = negative_slope
-        self.dropout = dropout
+        self.num_layers = num_layers
 
-        self.weight = nn.Parameter(
-            torch.Tensor(in_channels, heads * out_channels))
-        self.att = nn.Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        layers = []
 
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
-        else:
-            self.register_parameter('bias', None)
+        for i in range(num_layers):
+            in_dim = in_channels if i == 0 else out_channels * head if concat else out_channels
+            out_dim = out_channels
 
-        self.reset_parameters()
+            layers.append(
+                GATv2Conv(
+                    in_channels=in_dim,
+                    out_channels=out_dim,
+                    heads=head,
+                    concat=concat,
+                    negative_slope=negative_slope,
+                    dropout=dropout,
+                    bias=bias
+                )
+            )
 
-    def reset_parameters(self):
-        glorot(self.weight)
-        glorot(self.att)
-        zeros(self.bias)
+        self.gat = nn.ModuleList(layers)
+        self.activation = nn.ReLU()
 
     def forward(self, x, edge_index):
-        """"""
-        edge_index = add_self_loops(edge_index, num_nodes=x.size(0))
-        x = torch.mm(x, self.weight).view(-1, self.heads, self.out_channels)
-        return self.propagate('add', edge_index, x=x, num_nodes=x.size(0))
-
-    def message(self, x_i, x_j, edge_index, num_nodes):
-        # Compute attention coefficients.
-        alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
-        alpha = F.leaky_relu(alpha, self.negative_slope)
-        alpha = softmax(alpha, edge_index[0], num_nodes)
-
-        alpha = F.dropout(alpha, p=self.dropout)
-
-        return x_j * alpha.view(-1, self.heads, 1)
-
-    def update(self, aggr_out):
-        if self.concat is True:
-            aggr_out = aggr_out.view(-1, self.heads * self.out_channels)
-        else:
-            aggr_out = aggr_out.mean(dim=1)
-
-        if self.bias is not None:
-            aggr_out = aggr_out + self.bias
-        return aggr_out
+        for layer in self.gat:
+            x = layer(x, edge_index)
+            x = self.activation(x)
+        return x
 
     def __repr__(self):
-        return '{}({}, {}, heads={})'.format(self.__class__.__name__,
-                                             self.in_channels,
-                                             self.out_channels, self.heads)
-
+        return '{}({}, {}, heads={}, layers={})'.format(self.__class__.__name__,
+                                                        self.in_channels,
+                                                        self.out_channels,
+                                                        self.head,
+                                                        self.num_layers)
 
 class ConcatEmbeddings(nn.Module):
     """Concat rx and dx ontology embedding for easy access

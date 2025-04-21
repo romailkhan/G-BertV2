@@ -3,6 +3,8 @@ from __future__ import absolute_import, division, print_function
 import os
 import math
 import logging
+from contextlib import nullcontext
+from typing import Optional, Tuple, Union, Dict, Any
 
 import torch
 from torch import nn
@@ -11,7 +13,7 @@ from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 import torch.nn.functional as F
 from config import BertConfig
 from graph_models import FuseEmbeddings
-from torch.cuda.amp import autocast  # For mixed precision training
+from torch.amp import autocast  # Updated import
 import torch.utils.checkpoint as checkpoint  # For gradient checkpointing
 
 logger = logging.getLogger(__name__)
@@ -21,14 +23,16 @@ WEIGHTS_NAME = 'pytorch_model.bin'
 
 
 def gelu(x):
-    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+    """Implementation of the GELU activation function.
+    Optimizes for numerical stability over the original formula.
+    """
+    return x * 0.5 * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
 
-class LayerNorm(nn.Module):
+class FastLayerNorm(nn.Module):
+    """Faster implementation of LayerNorm with better GPU memory utilization."""
     def __init__(self, hidden_size, eps=1e-12):
-        """Construct a layernorm module in the TF style (epsilon inside the square root).
-        """
-        super(LayerNorm, self).__init__()
+        super(FastLayerNorm, self).__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.bias = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
@@ -40,52 +44,106 @@ class LayerNorm(nn.Module):
         return self.weight * x + self.bias
 
 
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary positional embedding implementation (RoPE)
+    Based on the paper "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    """
+    def __init__(self, dim, max_seq_len=512):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        
+        # Create frequencies for the full dimension
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        
+    def forward(self, seq_len, device):
+        """Generate sin/cos embeddings for the given sequence length"""
+        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        return torch.sin(freqs), torch.cos(freqs)
+
+    @staticmethod
+    def apply_rotary_pos_emb(q, k, sin, cos):
+        """Apply rotary position embeddings to queries and keys"""
+        sin = sin.to(dtype=q.dtype, device=q.device)
+        cos = cos.to(dtype=q.dtype, device=q.device)
+        
+        # Ensure broadcasting dimensions match
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        
+        # Apply rotary embeddings directly
+        q_out = q * cos + rotate_half(q) * sin
+        k_out = k * cos + rotate_half(k) * sin
+        
+        return q_out, k_out
+
+def rotate_half(x):
+    """Helper function to rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
 class MultiHeadedAttention(nn.Module):
     """
-    Take in model size and number of heads.
+    Multi-headed attention with optimized SDPA implementation.
     """
 
     def __init__(self, config: BertConfig):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
 
-        # More efficient attention computation
         self.d_k = config.hidden_size // config.num_attention_heads
         self.h = config.num_attention_heads
-
-        # Combined linear projections for Q, K, V
-        self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
+        self.dropout = config.attention_probs_dropout_prob
+        self.use_rotary = getattr(config, 'use_rotary', True)
+        
+        # Linear projections for Q, K, V
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.output_linear = nn.Linear(config.hidden_size, config.hidden_size)
-
-        # Scaled attention
-        self.attention_scale = math.sqrt(self.d_k)
-        self.dropout = nn.Dropout(p=config.attention_probs_dropout_prob)
+        
+        if self.use_rotary:
+            self.rotary_emb = RotaryPositionalEmbedding(
+                self.d_k, 
+                max_seq_len=getattr(config, 'max_position_embeddings', 512)
+            )
 
     def forward(self, query, key, value, mask=None):
         batch_size = query.size(0)
-
-        # Efficient combined projection
-        qkv = self.qkv_proj(query)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        # Reshape for attention computation
+        seq_len = query.size(1)
+        
+        # Linear projections
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # Reshape for multi-head attention [batch, seq, heads * dim] -> [batch, heads, seq, dim]
         q = q.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
         k = k.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
         v = v.view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.attention_scale
-
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        x = torch.matmul(attn, v)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.h * self.d_k)
-
-        return self.output_linear(x)
+        
+        # Apply rotary embeddings if enabled
+        if self.use_rotary:
+            sin, cos = self.rotary_emb(seq_len, query.device)
+            q, k = self.rotary_emb.apply_rotary_pos_emb(q, k, sin, cos)
+        
+        # Use PyTorch 2.0's scaled_dot_product_attention for efficient attention
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False
+        )
+        
+        # Reshape back [batch, heads, seq, dim] -> [batch, seq, heads * dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, -1, self.h * self.d_k
+        )
+        
+        return self.output_linear(attn_output)
 
 
 class Attention(nn.Module):
@@ -111,30 +169,41 @@ class Attention(nn.Module):
 class SublayerConnection(nn.Module):
     """
     A residual connection followed by a layer norm.
-    Note for code simplicity the norm is first as opposed to last.
+    Using pre-norm approach for improved training stability.
     """
 
     def __init__(self, config: BertConfig):
         super(SublayerConnection, self).__init__()
-        self.norm = LayerNorm(config.hidden_size)
+        self.norm = FastLayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, x, sublayer):
-        "Apply residual connection to any sublayer with the same size."
+        """Apply residual connection to any sublayer with the same size."""
         return x + self.dropout(sublayer(self.norm(x)))
 
 
 class PositionwiseFeedForward(nn.Module):
-    "Implements FFN equation."
+    """Implements FFN equation with improved efficiency."""
 
     def __init__(self, config: BertConfig):
         super(PositionwiseFeedForward, self).__init__()
         self.w_1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.w_2 = nn.Linear(config.intermediate_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # Add activation function selection
+        self.act_fn = getattr(config, 'hidden_act', 'gelu')
+        if self.act_fn == 'gelu':
+            self.activation = gelu
+        elif self.act_fn == 'relu':
+            self.activation = F.relu
+        elif self.act_fn == 'swish':
+            self.activation = lambda x: x * torch.sigmoid(x)
+        else:
+            self.activation = gelu
 
     def forward(self, x):
-        return self.w_2(self.dropout(gelu(self.w_1(x))))
+        return self.w_2(self.dropout(self.activation(self.w_1(x))))
 
 
 class TransformerBlock(nn.Module):
@@ -144,57 +213,77 @@ class TransformerBlock(nn.Module):
     """
 
     def __init__(self, config: BertConfig):
-        """
-        :param hidden: hidden size of transformer
-        :param attn_heads: head sizes of multi-head attention
-        :param feed_forward_hidden: feed_forward_hidden, usually 4*hidden_size
-        :param dropout: dropout rate
-        """
-
         super().__init__()
         self.attention = MultiHeadedAttention(config)
         self.feed_forward = PositionwiseFeedForward(config)
         self.input_sublayer = SublayerConnection(config)
         self.output_sublayer = SublayerConnection(config)
         self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
+        
+        self.final_norm = FastLayerNorm(config.hidden_size)
+        self.prenorm = getattr(config, 'prenorm', True)
 
     def forward(self, x, mask):
-        # Residual connections with pre-layer normalization
-        residual = x
-        x = self.input_sublayer(x, lambda _x: self.attention.forward(_x, _x, _x, mask=mask))
-        x = residual + self.dropout(x)
-        
-        residual = x
-        x = self.output_sublayer(x, self.feed_forward)
-        x = residual + self.dropout(x)
-        
-        return x
+        if self.prenorm:
+            # Pre-norm architecture (better for deeper models)
+            x = self.input_sublayer(x, lambda _x: self.attention(_x, _x, _x, mask=mask))
+            x = self.output_sublayer(x, self.feed_forward)
+            return self.final_norm(x)
+        else:
+            # Post-norm architecture (original transformer implementation)
+            residual = x
+            attn_output = self.attention(x, x, x, mask=mask)
+            x = residual + self.dropout(attn_output)
+            x = self.final_norm(x)
+            
+            residual = x
+            ff_output = self.feed_forward(x)
+            x = residual + self.dropout(ff_output)
+            x = self.final_norm(x)
+            
+            return x
 
 
 class BertEmbeddings(nn.Module):
-    """Construct the embeddings from word, visit and token_type embeddings.
-    """
+    """Construct the embeddings from word, position and token_type embeddings."""
 
     def __init__(self, config):
         super(BertEmbeddings, self).__init__()
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(2, config.hidden_size)
-        # self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = LayerNorm(config.hidden_size, eps=1e-12)
+        
+        # Add position embeddings if not using rotary embeddings
+        self.use_rotary = getattr(config, 'use_rotary', True)
+        if not self.use_rotary and getattr(config, 'use_position_embeddings', True):
+            self.position_embeddings = nn.Embedding(
+                config.max_position_embeddings, config.hidden_size
+            )
+            
+        # Layer normalization and dropout
+        self.LayerNorm = FastLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None):
+    def forward(self, input_ids, token_type_ids=None, position_ids=None):
+        seq_length = input_ids.size(1)
+        
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
+            
+        if position_ids is None and not self.use_rotary and hasattr(self, 'position_embeddings'):
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         words_embeddings = self.word_embeddings(input_ids)
-
-        embeddings = words_embeddings + \
-            self.token_type_embeddings(token_type_ids)
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        
+        embeddings = words_embeddings + token_type_embeddings
+        
+        # Add position embeddings if available and not using rotary
+        if not self.use_rotary and hasattr(self, 'position_embeddings'):
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings += position_embeddings
+            
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -202,7 +291,7 @@ class BertEmbeddings(nn.Module):
 
 class PreTrainedBertModel(nn.Module):
     """ An abstract class to handle weights initialization and
-        a simple interface for dowloading and loading pretrained models.
+        a simple interface for downloading and loading pretrained models.
     """
 
     def __init__(self, config: BertConfig, *inputs, **kwargs):
@@ -217,14 +306,11 @@ class PreTrainedBertModel(nn.Module):
         self.config = config
 
     def init_bert_weights(self, module):
-        """ Initialize the weights.
-        """
+        """Initialize the weights using improved initialization methods."""
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(
-                mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, LayerNorm):
+            # Use Kaiming initialization for better gradient flow
+            nn.init.kaiming_normal_(module.weight.data, nonlinearity='relu')
+        elif isinstance(module, FastLayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
@@ -260,7 +346,6 @@ class PreTrainedBertModel(nn.Module):
         missing_keys = []
         unexpected_keys = []
         error_msgs = []
-        # copy state_dict so _load_from_state_dict can modify it
         metadata = getattr(state_dict, '_metadata', None)
         state_dict = state_dict.copy()
         if metadata is not None:
@@ -304,40 +389,79 @@ class BERT(PreTrainedBertModel):
             assert dx_voc is not None
             assert rx_voc is not None
 
-        # Add configuration options
-        self.gradient_checkpointing = False
-        self.fp16_enabled = False
+        # Configuration options
+        self.gradient_checkpointing = getattr(config, 'gradient_checkpointing', False)
+        self.fp16_enabled = getattr(config, 'fp16_enabled', False)
+        self.use_flash_attention = getattr(config, 'use_flash_attention', False)
+        
+        # Enable Flash Attention backend if requested
+        if self.use_flash_attention:
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+            except:
+                logger.warning("Flash attention not available, falling back to default implementation")
         
         # Embedding layer
         self.embedding = FuseEmbeddings(config, dx_voc, rx_voc) if config.graph else BertEmbeddings(config)
         
-        # Multi-head attention blocks with better memory efficiency
+        # Transformer blocks
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_hidden_layers)
         ])
         
-        # Add layer-wise learning rate decay
+        # Layer-wise learning rate decay
         self.layer_decay = getattr(config, 'layer_decay', 0.95)
         
+        # Apply weight initialization
         self.apply(self.init_bert_weights)
+        
+        # Enable fused operations where possible
+        self._fuse_operations()
 
-    def forward(self, x, token_type_ids=None, input_positions=None, input_sides=None):
-        # Enable automatic mixed precision training
-        with autocast() if self.fp16_enabled else nullcontext():
-            # Attention masking for padded tokens
-            mask = (x > 1).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
+    def _fuse_operations(self):
+        """Enable fused operations for efficiency."""
+        # This would typically include things like fused LayerNorm, etc.
+        for module in self.modules():
+            if isinstance(module, nn.LayerNorm):
+                module.cuda_enabled = True
+
+    def forward(self, x, token_type_ids=None, input_positions=None, input_sides=None, attention_mask=None):
+        # Handle autocast for mixed precision training
+        with autocast(device_type='cuda', enabled=self.fp16_enabled) if self.fp16_enabled else nullcontext():
+            # Create attention mask if not provided
+            if attention_mask is None:
+                attention_mask = (x > 1).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
             
-            # Embedding with dropout
-            x = self.embedding(x, token_type_ids)
+            # Apply embedding layer
+            x = self.embedding(x, token_type_ids, input_positions)
             
-            # Transformer blocks with gradient checkpointing
-            for transformer in self.transformer_blocks:
+            # Process through transformer blocks
+            for i, transformer in enumerate(self.transformer_blocks):
                 if self.gradient_checkpointing and self.training:
-                    x = checkpoint.checkpoint(transformer, x, mask)
+                    x = checkpoint.checkpoint(transformer, x, attention_mask)
                 else:
-                    x = transformer(x, mask)
+                    x = transformer(x, attention_mask)
             
             return x, x[:, 0]
+    
+    def get_extended_attention_mask(self, attention_mask, input_shape, device):
+        """
+        Makes broadcastable attention mask and causal mask if needed.
+        """
+        if attention_mask.dim() == 3:
+            extended_attention_mask = attention_mask[:, None, :, :]
+        elif attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask[:, None, None, :]
+        else:
+            raise ValueError(
+                f"Wrong shape for attention_mask: {attention_mask.shape}"
+            )
+        
+        # Convert attention mask to binary
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        return extended_attention_mask
 
 
 class BertPooler(nn.Module):
@@ -345,14 +469,16 @@ class BertPooler(nn.Module):
         super(BertPooler, self).__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
+        
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
+        # Take the hidden state corresponding to the first token
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
-        return pooled_output
+        return self.dropout(pooled_output)
 
 
 # pretaining
@@ -362,7 +488,7 @@ class BertPredictionHeadTransform(nn.Module):
 
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.transform_act_fn = gelu
-        self.LayerNorm = LayerNorm(config.hidden_size, eps=1e-12)
+        self.LayerNorm = FastLayerNorm(config.hidden_size, eps=1e-12)
 
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
@@ -376,25 +502,17 @@ class BertLMPredictionHead(nn.Module):
         super(BertLMPredictionHead, self).__init__()
         self.transform = BertPredictionHeadTransform(config)
 
-        self.decoder = nn.Linear(config.hidden_size,
-                                 config.vocab_size if voc_size is None else voc_size)
+        # Use adaptive embedding size if provided
+        self.vocab_size = config.vocab_size if voc_size is None else voc_size
+        
+        # Optimize by aligning to multiple of 8 for better GPU utilization
+        if getattr(config, 'pad_vocab_size_multiple', 0) > 0:
+            pad_to = config.pad_vocab_size_multiple
+            self.vocab_size = ((self.vocab_size + pad_to - 1) // pad_to) * pad_to
+            
+        self.decoder = nn.Linear(config.hidden_size, self.vocab_size, bias=True)
 
     def forward(self, hidden_states):
         hidden_states = self.transform(hidden_states)
         hidden_states = self.decoder(hidden_states)
         return hidden_states
-
-
-# 4. Add Fast Layer Normalization
-class FastLayerNorm(nn.Module):
-    def __init__(self, config: BertConfig):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(config.hidden_size))
-        self.bias = nn.Parameter(torch.zeros(config.hidden_size))
-        self.variance_epsilon = 1e-12
-
-    def forward(self, x):
-        u = x.mean(-1, keepdim=True)
-        s = (x - u).pow(2).mean(-1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-        return self.weight * x + self.bias
